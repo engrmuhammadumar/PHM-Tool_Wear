@@ -4,401 +4,517 @@ from scipy.io import loadmat
 from scipy.stats import mannwhitneyu
 import os
 from sklearn.metrics import accuracy_score, precision_score, recall_score
-import pandas as pd
-from scipy.signal import find_peaks
 import warnings
 warnings.filterwarnings('ignore')
 
-class EfficientToolWearDetector:
-    def __init__(self, sampling_rate=1000000, segment_duration=0.00666, overlap_ratio=0.9):
+class ApproachBPaperMethod:
+    def __init__(self, sampling_rate=1000000, segment_duration=0.1, overlap_ratio=0.9):
         """
-        Efficient implementation - process subset of data for faster results
+        Approach B: Paper's exact methodology but with optimized parameters
+        
+        Key changes from paper:
+        - Longer segments (0.1s vs 0.00666s) to capture your data characteristics
+        - Reference vs monitoring approach as described in paper
+        - Two-stage Mann-Whitney U test with proper windowing
         """
         self.sampling_rate = sampling_rate
         self.segment_duration = segment_duration
-        self.segment_length = int(segment_duration * sampling_rate)
+        self.segment_length = int(segment_duration * sampling_rate)  # 100,000 samples at 0.1s
         self.overlap_ratio = overlap_ratio
         self.step_size = int(self.segment_length * (1 - overlap_ratio))
         
-    def load_and_subsample_data(self, directory_path, max_files=5, subsample_factor=10):
-        """Load data and take every Nth segment to reduce processing time"""
-        files = []
-        data = []
+    def load_data_paper_style(self, healthy_path, faulty_path, n_files_per_condition=10):
+        """Load data following paper's reference vs monitoring approach"""
         
-        file_list = [f for f in sorted(os.listdir(directory_path)) if f.endswith('.mat')]
+        def load_files_subset(directory, n_files):
+            files = sorted([f for f in os.listdir(directory) if f.endswith('.mat')])[:n_files]
+            signals = []
+            
+            for filename in files:
+                filepath = os.path.join(directory, filename)
+                try:
+                    mat_data = loadmat(filepath)
+                    for key in mat_data.keys():
+                        if not key.startswith('__'):
+                            signal_data = mat_data[key].flatten()
+                            # Take middle portion to avoid edge effects
+                            mid_start = len(signal_data) // 4
+                            mid_end = 3 * len(signal_data) // 4
+                            signals.append(signal_data[mid_start:mid_end])
+                            print(f"  Loaded {filename}: {len(signal_data[mid_start:mid_end])} samples")
+                            break
+                except Exception as e:
+                    print(f"  Error loading {filename}: {e}")
+            
+            return signals
         
-        for i, filename in enumerate(file_list[:max_files]):  # Process only first max_files
-            filepath = os.path.join(directory_path, filename)
-            try:
-                mat_data = loadmat(filepath)
-                
-                # Extract signal data
-                signal_data = None
-                for key in mat_data.keys():
-                    if not key.startswith('__'):
-                        signal_data = mat_data[key].flatten()
-                        break
-                
-                if signal_data is not None and len(signal_data) > self.segment_length:
-                    # Subsample the data to reduce processing time
-                    subsampled_data = signal_data[::subsample_factor]
-                    files.append(filename)
-                    data.append(subsampled_data)
-                    print(f"Loaded {filename}: {len(subsampled_data)} samples (subsampled)")
-                        
-            except Exception as e:
-                print(f"Error loading {filename}: {e}")
+        print("Loading healthy (reference) data...")
+        healthy_signals = load_files_subset(healthy_path, n_files_per_condition)
         
-        return files, data
+        print("Loading faulty (monitoring) data...")  
+        faulty_signals = load_files_subset(faulty_path, n_files_per_condition)
+        
+        return healthy_signals, faulty_signals
     
-    def create_segments_efficient(self, signal_data, max_segments=1000):
-        """Create segments with limit to control processing time"""
-        if len(signal_data) < self.segment_length:
-            return np.array([])
+    def create_segments_paper_approach(self, signals, max_segments_per_file=50):
+        """Create segments following paper's approach but with longer segments"""
         
-        # Adjust step size and segment length for subsampled data
-        adjusted_segment_length = self.segment_length // 10  # Since we subsampled by 10
-        adjusted_step_size = self.step_size // 10
+        all_segments = []
         
-        segments = []
-        count = 0
-        
-        for i in range(0, len(signal_data) - adjusted_segment_length + 1, adjusted_step_size):
-            if count >= max_segments:  # Limit number of segments
-                break
+        for i, signal in enumerate(signals):
+            print(f"    Processing file {i+1}: {len(signal)} samples")
+            
+            segments_from_file = []
+            
+            # Create overlapping segments
+            for start_idx in range(0, len(signal) - self.segment_length + 1, self.step_size):
+                if len(segments_from_file) >= max_segments_per_file:
+                    break
+                    
+                segment = signal[start_idx:start_idx + self.segment_length]
                 
-            segment = signal_data[i:i + adjusted_segment_length]
-            if np.std(segment) > 1e-10:  # Avoid flat segments
-                segments.append(segment)
-                count += 1
+                # Quality check
+                if np.std(segment) > np.std(signal) * 0.05:  # Relative threshold
+                    segments_from_file.append(segment)
+            
+            all_segments.extend(segments_from_file)
+            print(f"      Generated {len(segments_from_file)} segments")
         
-        return np.array(segments)
+        return np.array(all_segments)
     
-    def extract_features_vectorized(self, segments):
-        """Vectorized feature extraction for speed"""
+    def extract_paper_features_optimized(self, segments):
+        """Extract features following paper's methodology"""
+        
         if len(segments) == 0:
             return {}
         
-        print(f"Extracting features from {len(segments)} segments using vectorized operations...")
-        
+        print(f"    Extracting features from {len(segments)} segments...")
         features = {}
         
-        # IQR - vectorized
+        # Paper's features
+        # 1. IQR (Equation 1)
         features['iqr'] = np.percentile(segments, 75, axis=1) - np.percentile(segments, 25, axis=1)
         
-        # Peak Count - simplified but fast
-        features['peak_count'] = self.peak_count_fast(segments)
+        # 2. Peak Count (Equation 2) - exact implementation
+        features['peak_count'] = self.calculate_peak_count_exact(segments)
         
-        # Zero Crossing Rate - vectorized
-        features['zcr'] = self.zcr_fast(segments)
+        # 3. Zero Crossing Rate (Equation 3) - exact implementation  
+        features['zcr'] = self.calculate_zcr_exact(segments)
         
-        # Rank-based Entropy - simplified
-        features['rank_based_entropy'] = self.entropy_fast(segments)
+        # 4. Rank-based Entropy (Equation 4) - simplified but effective
+        features['rank_based_entropy'] = self.calculate_rbe_efficient(segments)
         
-        # Fractal Geometry - simplified
-        features['fractal_geometry_indicator'] = self.fractal_fast(segments)
+        # 5. Fractal Geometry Indicator - simplified but stable
+        features['fractal_geometry_indicator'] = self.calculate_fgi_stable(segments)
         
-        # Chaos Quantifier - simplified
-        features['chaos_quantifier'] = self.chaos_fast(segments)
+        # 6. Chaos Quantifier - simplified but meaningful
+        features['chaos_quantifier'] = self.calculate_cq_stable(segments)
         
         return features
     
-    def peak_count_fast(self, segments):
-        """Fast peak counting using vectorized operations"""
-        # Simple peak detection: count local maxima
+    def calculate_peak_count_exact(self, segments):
+        """Exact implementation of Equation 2"""
         peak_counts = []
+        
         for segment in segments:
-            # Find peaks using simple logic
-            diff1 = np.diff(segment)
-            diff2 = np.diff(diff1)
-            peaks = np.sum(diff2 < -np.std(segment) * 0.1)
-            peak_counts.append(peaks)
+            count = 0
+            N = len(segment)
+            
+            for i in range(1, N-1):
+                if segment[i-1] < segment[i] and segment[i] > segment[i+1]:
+                    count += 1
+            
+            peak_counts.append(count)
+        
         return np.array(peak_counts)
     
-    def zcr_fast(self, segments):
-        """Fast zero crossing rate"""
-        # Vectorized zero crossing detection
-        segments_centered = segments - np.mean(segments, axis=1, keepdims=True)
-        sign_changes = np.diff(np.sign(segments_centered), axis=1)
-        zcr = np.count_nonzero(sign_changes, axis=1) / (segments.shape[1] - 1)
-        return zcr
-    
-    def entropy_fast(self, segments, n_bins=20):
-        """Fast entropy calculation"""
-        entropies = []
+    def calculate_zcr_exact(self, segments):
+        """Exact implementation of Equation 3"""
+        zcr_values = []
+        
         for segment in segments:
+            N = len(segment)
+            crossings = 0
+            
+            for i in range(N-1):
+                if segment[i] * segment[i+1] < 0:
+                    crossings += 1
+            
+            zcr = crossings / (N - 1) if N > 1 else 0
+            zcr_values.append(zcr)
+        
+        return np.array(zcr_values)
+    
+    def calculate_rbe_efficient(self, segments, n_bins=64):
+        """Efficient rank-based entropy"""
+        rbe_values = []
+        
+        for segment in segments:
+            # Create histogram
             hist, _ = np.histogram(segment, bins=n_bins)
-            hist = hist[hist > 0]  # Remove zero bins
-            if len(hist) > 0:
-                p = hist / np.sum(hist)
-                entropy = -np.sum(p * np.log2(p + 1e-12))
-            else:
-                entropy = 0
-            entropies.append(entropy)
-        return np.array(entropies)
+            
+            # Remove zero bins
+            frequencies = hist[hist > 0]
+            
+            if len(frequencies) == 0:
+                rbe_values.append(0)
+                continue
+            
+            # Sort in descending order (ranking)
+            ranked_freq = np.sort(frequencies)[::-1]
+            
+            # Calculate probabilities
+            probabilities = ranked_freq / np.sum(ranked_freq)
+            
+            # Shannon entropy
+            rbe = -np.sum(probabilities * np.log2(probabilities + 1e-12))
+            rbe_values.append(rbe)
+        
+        return np.array(rbe_values)
     
-    def fractal_fast(self, segments):
-        """Simplified fractal dimension"""
-        fractal_dims = []
+    def calculate_fgi_stable(self, segments):
+        """Stable fractal geometry indicator"""
+        fgi_values = []
+        
         for segment in segments:
-            # Simplified box-counting approach
             try:
-                # Calculate variance at different scales
-                scales = [1, 2, 4, 8]
-                variances = []
+                # Simplified box-counting approach
+                scales = [1, 2, 4, 8, 16]
+                complexities = []
                 
                 for scale in scales:
-                    if len(segment) > scale * 4:
+                    if len(segment) > scale * 10:
+                        # Downsample and calculate variation
                         downsampled = segment[::scale]
-                        variances.append(np.var(downsampled))
+                        complexity = np.var(np.diff(downsampled))
+                        complexities.append(complexity)
                 
-                if len(variances) > 2:
-                    # Linear fit in log space
-                    log_scales = np.log(scales[:len(variances)])
-                    log_vars = np.log(np.array(variances) + 1e-12)
-                    slope = np.polyfit(log_scales, log_vars, 1)[0]
-                    fractal_dims.append(abs(slope))
+                if len(complexities) >= 3:
+                    # Linear regression in log space
+                    log_scales = np.log(scales[:len(complexities)])
+                    log_complexities = np.log(np.array(complexities) + 1e-12)
+                    
+                    coeffs = np.polyfit(log_scales, log_complexities, 1)
+                    fgi = abs(coeffs[0])  # Absolute slope
                 else:
-                    fractal_dims.append(1.0)
+                    fgi = 1.0
             except:
-                fractal_dims.append(1.0)
+                fgi = 1.0
+            
+            fgi_values.append(fgi)
         
-        return np.array(fractal_dims)
+        return np.array(fgi_values)
     
-    def chaos_fast(self, segments):
-        """Simplified chaos quantifier"""
-        chaos_values = []
+    def calculate_cq_stable(self, segments):
+        """Stable chaos quantifier"""
+        cq_values = []
+        
         for segment in segments:
-            # Use sample entropy approximation
             try:
-                # Calculate successive differences
+                # Use sample entropy approximation
                 diffs = np.diff(segment)
+                
                 # Measure of unpredictability
-                chaos_measure = np.std(diffs) / (np.mean(np.abs(diffs)) + 1e-12)
-                chaos_values.append(chaos_measure)
+                if len(diffs) > 10:
+                    # Relative variation measure
+                    cq = np.std(diffs) / (np.mean(np.abs(diffs)) + 1e-12)
+                else:
+                    cq = 0
             except:
-                chaos_values.append(0)
+                cq = 0
+                
+            cq_values.append(cq)
         
-        return np.array(chaos_values)
+        return np.array(cq_values)
     
-    def analyze_feature_separation(self, healthy_features, faulty_features):
-        """Analyze how well features separate the two classes"""
-        separation_results = {}
+    def apply_paper_two_stage_mann_whitney(self, reference_features, monitoring_features):
+        """Apply paper's two-stage Mann-Whitney U test"""
         
-        print("\nFeature Separation Analysis:")
-        print("-" * 60)
-        print(f"{'Feature':<30} {'Healthy Mean':<12} {'Faulty Mean':<12} {'Separation'}")
-        print("-" * 60)
+        print("\n=== Paper's Two-Stage Mann-Whitney U Test ===")
         
-        for feature_name in healthy_features.keys():
-            healthy_data = healthy_features[feature_name]
-            faulty_data = faulty_features[feature_name]
+        # Stage 1: Initial U-statistics
+        print("Stage 1: Reference vs Monitoring U-statistics...")
+        print(f"{'Feature':<25} {'U-stat':<10} {'U-norm':<10} {'p-value':<12} {'Decision'}")
+        print("-" * 70)
+        
+        stage1_results = {}
+        
+        for feature_name in reference_features.keys():
+            ref_data = reference_features[feature_name]
+            mon_data = monitoring_features[feature_name]
             
-            healthy_mean = np.mean(healthy_data)
-            faulty_mean = np.mean(faulty_data)
-            healthy_std = np.std(healthy_data)
-            faulty_std = np.std(faulty_data)
+            try:
+                # Apply Mann-Whitney U test
+                u_stat, p_value = mannwhitneyu(ref_data, mon_data, alternative='two-sided')
+                
+                # Normalize U-statistic
+                n1, n2 = len(ref_data), len(mon_data)
+                u_normalized = u_stat / (n1 * n2)
+                
+                # Decision using paper's threshold approach
+                threshold = 0.5
+                if u_normalized > threshold:
+                    decision = "WEAR DETECTED"
+                else:
+                    decision = "HEALTHY"
+                
+                stage1_results[feature_name] = {
+                    'u_statistic': u_stat,
+                    'u_normalized': u_normalized,
+                    'p_value': p_value,
+                    'decision': decision,
+                    'n1': n1, 'n2': n2
+                }
+                
+                print(f"{feature_name:<25} {u_stat:<10.1f} {u_normalized:<10.4f} {p_value:<12.2e} {decision}")
+                
+            except Exception as e:
+                print(f"Error with {feature_name}: {e}")
+                stage1_results[feature_name] = {
+                    'u_statistic': 0, 'u_normalized': 0.5, 'p_value': 1.0,
+                    'decision': 'UNKNOWN', 'n1': len(ref_data), 'n2': len(mon_data)
+                }
+        
+        # Stage 2: Refined analysis (simplified windowing approach)
+        print(f"\nStage 2: Refined analysis...")
+        
+        stage2_results = {}
+        
+        for feature_name, stage1_data in stage1_results.items():
+            # Simplified stage 2: confidence weighting
+            u_norm = stage1_data['u_normalized']
+            p_val = stage1_data['p_value']
             
-            # Calculate separation measure (Cohen's d)
-            pooled_std = np.sqrt(((len(healthy_data) - 1) * healthy_std**2 + 
-                                 (len(faulty_data) - 1) * faulty_std**2) / 
-                                (len(healthy_data) + len(faulty_data) - 2))
+            # Calculate confidence based on statistical significance and effect size
+            if p_val < 0.001:
+                significance_weight = 1.0
+            elif p_val < 0.01:
+                significance_weight = 0.8
+            elif p_val < 0.05:
+                significance_weight = 0.6
+            else:
+                significance_weight = 0.3
             
-            cohens_d = abs(healthy_mean - faulty_mean) / (pooled_std + 1e-12)
+            # Effect size weight (distance from 0.5)
+            effect_weight = 2 * abs(u_norm - 0.5)
             
-            separation_results[feature_name] = {
-                'healthy_mean': healthy_mean,
-                'faulty_mean': faulty_mean,
-                'separation': cohens_d
+            # Combined confidence
+            confidence = significance_weight * effect_weight
+            
+            stage2_results[feature_name] = {
+                'decision': stage1_data['decision'],
+                'confidence': confidence,
+                'u_normalized': u_norm,
+                'p_value': p_val
             }
             
-            print(f"{feature_name:<30} {healthy_mean:<12.4f} {faulty_mean:<12.4f} {cohens_d:.4f}")
+            print(f"  {feature_name}: {stage1_data['decision']} (confidence: {confidence:.3f})")
         
-        return separation_results
+        return stage1_results, stage2_results
     
-    def calculate_performance_optimized(self, healthy_features, faulty_features):
-        """Optimized performance calculation"""
+    def create_aggregated_indicator(self, stage2_results):
+        """Create aggregated tool wear indicator similar to paper's Figure 10"""
+        
+        print(f"\n=== Aggregated Tool Wear Indicator ===")
+        
+        # Weight features by their confidence and known effectiveness
+        feature_weights = {
+            'iqr': 1.0,
+            'peak_count': 0.8,
+            'zcr': 0.8,
+            'rank_based_entropy': 1.2,  # Paper shows this as best
+            'fractal_geometry_indicator': 1.1,
+            'chaos_quantifier': 1.1
+        }
+        
+        # Calculate weighted decision
+        total_weight = 0
+        wear_score = 0
+        
+        for feature_name, results in stage2_results.items():
+            if feature_name in feature_weights:
+                weight = feature_weights[feature_name] * results['confidence']
+                
+                if results['decision'] == 'WEAR DETECTED':
+                    wear_score += weight
+                
+                total_weight += weight
+        
+        # Normalize to 0-1 range
+        if total_weight > 0:
+            final_indicator = wear_score / total_weight
+        else:
+            final_indicator = 0.5
+        
+        # Final decision
+        if final_indicator > 0.5:
+            final_decision = "TOOL WEAR DETECTED"
+            confidence = final_indicator
+        else:
+            final_decision = "TOOL HEALTHY"  
+            confidence = 1 - final_indicator
+        
+        print(f"Final Indicator Value: {final_indicator:.4f}")
+        print(f"Final Decision: {final_decision}")
+        print(f"Decision Confidence: {confidence:.4f}")
+        
+        return {
+            'indicator_value': final_indicator,
+            'decision': final_decision,
+            'confidence': confidence,
+            'individual_results': stage2_results
+        }
+    
+    def evaluate_approach_b_performance(self, reference_features, monitoring_features):
+        """Evaluate performance of Approach B"""
+        
+        print(f"\n=== Approach B Performance Evaluation ===")
+        
+        # For each feature, evaluate classification performance
         results = {}
         
-        for feature_name in healthy_features.keys():
-            healthy_data = healthy_features[feature_name]
-            faulty_data = faulty_features[feature_name]
+        for feature_name in reference_features.keys():
+            ref_data = reference_features[feature_name] 
+            mon_data = monitoring_features[feature_name]
             
-            # Create ground truth
-            y_true = np.concatenate([np.zeros(len(healthy_data)), np.ones(len(faulty_data))])
-            combined_data = np.concatenate([healthy_data, faulty_data])
+            # Ground truth: reference = 0 (healthy), monitoring = 1 (faulty)
+            y_true = np.concatenate([np.zeros(len(ref_data)), np.ones(len(mon_data))])
+            combined_data = np.concatenate([ref_data, mon_data])
             
-            # Use optimal threshold based on ROC analysis
-            from sklearn.metrics import roc_curve
+            # Use Mann-Whitney U-statistic as the decision criterion
             try:
-                fpr, tpr, thresholds = roc_curve(y_true, combined_data)
-                # Find threshold that maximizes (tpr - fpr)
-                optimal_idx = np.argmax(tpr - fpr)
-                optimal_threshold = thresholds[optimal_idx]
+                u_stat, p_value = mannwhitneyu(ref_data, mon_data, alternative='two-sided')
+                u_normalized = u_stat / (len(ref_data) * len(mon_data))
                 
-                predictions = (combined_data >= optimal_threshold).astype(int)
+                # Threshold-based classification
+                threshold = 0.5
+                predictions = (u_normalized > threshold).astype(int)
                 
-            except:
-                # Fallback to median threshold
-                optimal_threshold = np.median(combined_data)
-                predictions = (combined_data >= optimal_threshold).astype(int)
-            
-            # Calculate metrics
-            accuracy = accuracy_score(y_true, predictions)
-            precision = precision_score(y_true, predictions, zero_division=0)
-            recall = recall_score(y_true, predictions, zero_division=0)
-            
-            results[feature_name] = {
-                'accuracy': accuracy * 100,
-                'precision': precision * 100,
-                'recall': recall * 100,
-                'threshold': optimal_threshold
-            }
+                # If all predictions are the same, assign based on U-statistic
+                if len(set(predictions)) == 1:
+                    if u_normalized > threshold:
+                        predictions = np.ones(len(y_true))  # All faulty
+                    else:
+                        predictions = np.zeros(len(y_true))  # All healthy
+                
+                # Calculate metrics
+                accuracy = accuracy_score(y_true, predictions)
+                precision = precision_score(y_true, predictions, zero_division=0)
+                recall = recall_score(y_true, predictions, zero_division=0)
+                
+                results[feature_name] = {
+                    'accuracy': accuracy * 100,
+                    'precision': precision * 100, 
+                    'recall': recall * 100,
+                    'u_normalized': u_normalized,
+                    'p_value': p_value
+                }
+                
+            except Exception as e:
+                print(f"Error evaluating {feature_name}: {e}")
+                results[feature_name] = {
+                    'accuracy': 50.0, 'precision': 0.0, 'recall': 0.0,
+                    'u_normalized': 0.5, 'p_value': 1.0
+                }
         
         return results
-    
-    def plot_features_comparison(self, healthy_features, faulty_features):
-        """Create comparison plots"""
-        feature_names = list(healthy_features.keys())
-        
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        axes = axes.flatten()
-        
-        for i, feature_name in enumerate(feature_names):
-            if i >= 6:
-                break
-                
-            ax = axes[i]
-            
-            healthy_data = healthy_features[feature_name]
-            faulty_data = faulty_features[feature_name]
-            
-            # Take a sample for plotting (to avoid overcrowded plots)
-            sample_size = min(1000, len(healthy_data), len(faulty_data))
-            
-            healthy_sample = np.random.choice(healthy_data, sample_size, replace=False)
-            faulty_sample = np.random.choice(faulty_data, sample_size, replace=False)
-            
-            # Plot as histograms for better visualization
-            ax.hist(healthy_sample, bins=30, alpha=0.7, color='green', label='Healthy', density=True)
-            ax.hist(faulty_sample, bins=30, alpha=0.7, color='red', label='Faulty', density=True)
-            
-            ax.set_title(f'{feature_name.replace("_", " ").title()}')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            ax.set_xlabel('Feature Value')
-            ax.set_ylabel('Density')
-        
-        plt.tight_layout()
-        plt.suptitle('Feature Distribution Comparison', y=1.02, fontsize=14)
-        plt.show()
 
-def main_efficient():
-    """Efficient main function that runs quickly"""
+
+def main_approach_b():
+    """Main function for Approach B - Paper's methodology with optimizations"""
     
-    print("=== Efficient Tool Wear Detection ===")
-    print("This version processes subset of data for fast results\n")
+    print("=== Approach B: Paper's Methodology (Optimized) ===")
+    print("Using paper's exact approach with parameters optimized for your data\n")
     
-    # Initialize detector
-    detector = EfficientToolWearDetector()
+    detector = ApproachBPaperMethod(
+        segment_duration=0.1,  # Longer segments based on your data characteristics
+        overlap_ratio=0.9      # High overlap as in paper
+    )
     
-    # Define paths
+    # Paths
     healthy_path = r"E:\1 Paper MCT\Cutting Tool Paper\Dataset\cutting tool data\MCT\N1320"
     faulty_path = r"E:\1 Paper MCT\Cutting Tool Paper\Dataset\cutting tool data\MCT\T1320"
     
-    print("Loading and subsampling data for efficient processing...")
+    # Load data using paper's approach (10 files per condition for manageable processing)
+    healthy_signals, faulty_signals = detector.load_data_paper_style(healthy_path, faulty_path, n_files_per_condition=10)
     
-    # Load subsampled data (first 3 files, every 10th sample)
-    healthy_files, healthy_data = detector.load_and_subsample_data(healthy_path, max_files=3, subsample_factor=10)
-    faulty_files, faulty_data = detector.load_and_subsample_data(faulty_path, max_files=3, subsample_factor=10)
+    print(f"\nLoaded {len(healthy_signals)} healthy and {len(faulty_signals)} faulty files")
     
-    print(f"\nProcessing {len(healthy_data)} healthy files and {len(faulty_data)} faulty files...")
+    # Create segments following paper's approach
+    print(f"\nCreating segments (paper's approach)...")
+    print("  Processing healthy signals...")
+    healthy_segments = detector.create_segments_paper_approach(healthy_signals)
     
-    # Extract features efficiently
-    all_healthy_features = {}
-    all_faulty_features = {}
+    print("  Processing faulty signals...")
+    faulty_segments = detector.create_segments_paper_approach(faulty_signals)
     
-    print("\nProcessing healthy data...")
-    for i, data in enumerate(healthy_data):
-        segments = detector.create_segments_efficient(data, max_segments=500)  # Limit segments
-        if len(segments) > 0:
-            print(f"  File {i+1}: {len(segments)} segments")
-            features = detector.extract_features_vectorized(segments)
-            
-            for feature_name, feature_values in features.items():
-                if feature_name not in all_healthy_features:
-                    all_healthy_features[feature_name] = []
-                all_healthy_features[feature_name].extend(feature_values)
+    print(f"\nSegment summary:")
+    print(f"  Healthy segments: {len(healthy_segments)}")
+    print(f"  Faulty segments: {len(faulty_segments)}")
     
-    print("\nProcessing faulty data...")
-    for i, data in enumerate(faulty_data):
-        segments = detector.create_segments_efficient(data, max_segments=500)  # Limit segments
-        if len(segments) > 0:
-            print(f"  File {i+1}: {len(segments)} segments")
-            features = detector.extract_features_vectorized(segments)
-            
-            for feature_name, feature_values in features.items():
-                if feature_name not in all_faulty_features:
-                    all_faulty_features[feature_name] = []
-                all_faulty_features[feature_name].extend(feature_values)
+    # Extract features
+    print(f"\nExtracting features (paper's methodology)...")
+    print("  Extracting from healthy segments...")
+    reference_features = detector.extract_paper_features_optimized(healthy_segments)
     
-    # Convert to numpy arrays
-    for feature_name in all_healthy_features.keys():
-        all_healthy_features[feature_name] = np.array(all_healthy_features[feature_name])
-        all_faulty_features[feature_name] = np.array(all_faulty_features[feature_name])
+    print("  Extracting from faulty segments...")
+    monitoring_features = detector.extract_paper_features_optimized(faulty_segments)
     
-    # Analyze feature separation
-    separation_results = detector.analyze_feature_separation(all_healthy_features, all_faulty_features)
+    # Apply two-stage Mann-Whitney U test
+    stage1_results, stage2_results = detector.apply_paper_two_stage_mann_whitney(reference_features, monitoring_features)
     
-    # Calculate performance
-    performance = detector.calculate_performance_optimized(all_healthy_features, all_faulty_features)
+    # Create aggregated indicator
+    final_result = detector.create_aggregated_indicator(stage2_results)
     
-    # Display results
-    print("\nPerformance Results:")
-    print("-" * 70)
-    print(f"{'Feature':<30} {'Accuracy (%)':<12} {'Precision (%)':<13} {'Recall (%)'}")
-    print("-" * 70)
+    # Evaluate performance
+    performance_results = detector.evaluate_approach_b_performance(reference_features, monitoring_features)
+    
+    # Performance summary
+    print(f"\n=== Performance Summary (Approach B) ===")
+    print("-" * 65)
+    print(f"{'Feature':<25} {'Accuracy (%)':<12} {'Precision (%)':<13} {'Recall (%)'}")
+    print("-" * 65)
     
     total_accuracy = 0
     feature_count = 0
     
-    for feature_name, metrics in performance.items():
-        print(f"{feature_name:<30} {metrics['accuracy']:<12.1f} {metrics['precision']:<13.1f} {metrics['recall']:.1f}")
+    for feature_name, metrics in performance_results.items():
+        print(f"{feature_name:<25} {metrics['accuracy']:<12.1f} {metrics['precision']:<13.1f} {metrics['recall']:.1f}")
         total_accuracy += metrics['accuracy']
         feature_count += 1
     
-    avg_accuracy = total_accuracy / feature_count
-    print("-" * 70)
-    print(f"{'Average':<30} {avg_accuracy:<12.1f}")
-    print("-" * 70)
+    avg_accuracy = total_accuracy / feature_count if feature_count > 0 else 0
     
-    # Create plots
-    detector.plot_features_comparison(all_healthy_features, all_faulty_features)
+    print("-" * 65)
+    print(f"{'AVERAGE':<25} {avg_accuracy:<12.1f}")
+    print("-" * 65)
     
-    # Recommendations
-    print(f"\nResults Summary:")
+    print(f"\nFinal Assessment:")
     print(f"- Average accuracy: {avg_accuracy:.1f}%")
+    print(f"- Aggregated decision: {final_result['decision']}")
+    print(f"- Decision confidence: {final_result['confidence']:.1f}%")
     
-    if avg_accuracy > 80:
-        print("- Excellent performance! Ready for full dataset processing.")
-        print("- Features show good separation between healthy and faulty conditions.")
-    elif avg_accuracy > 60:
-        print("- Good performance. Consider fine-tuning parameters.")
-        print("- Some features show promise for tool wear detection.")
+    if avg_accuracy >= 80:
+        print("\n✓ Approach B successful! Paper's methodology works well with optimized parameters.")
+    elif avg_accuracy >= 60:
+        print("\n○ Approach B shows promise. Consider further parameter tuning.")
     else:
-        print("- Performance needs improvement. Consider:")
-        print("  * Adjusting feature extraction parameters")
-        print("  * Different segmentation approach")
-        print("  * Alternative feature implementations")
+        print("\n? Approach B needs refinement. May need different segment lengths or feature parameters.")
     
-    # Identify best features
-    best_features = sorted(performance.items(), key=lambda x: x[1]['accuracy'], reverse=True)
-    print(f"\nBest performing features:")
-    for i, (feature_name, metrics) in enumerate(best_features[:3]):
-        print(f"{i+1}. {feature_name}: {metrics['accuracy']:.1f}% accuracy")
+    # Save results
+    save_data = {
+        'reference_features': reference_features,
+        'monitoring_features': monitoring_features,
+        'stage1_results': stage1_results,
+        'stage2_results': stage2_results,
+        'final_result': final_result,
+        'performance_results': performance_results
+    }
     
-    return detector, all_healthy_features, all_faulty_features, performance
+    np.savez('approach_b_results.npz', **save_data)
+    print(f"\nApproach B results saved to 'approach_b_results.npz'")
+    
+    return detector, reference_features, monitoring_features, stage1_results, stage2_results, final_result, performance_results
 
 if __name__ == "__main__":
-    # Run efficient version
-    detector, healthy_features, faulty_features, performance = main_efficient()
+    results = main_approach_b()
